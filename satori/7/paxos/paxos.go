@@ -13,6 +13,62 @@ import (
 )
 
 const TIMEOUT_WAITING_PROMISES = time.Second // __jm__
+
+// region Supervisor
+type Supervisor struct {
+	quit chan struct{}
+	wg   *sync.WaitGroup
+}
+
+func NewSupervisor() *Supervisor {
+	return &Supervisor{quit: make(chan struct{}), wg: &sync.WaitGroup{}}
+}
+
+func (s *Supervisor) Start(tasks ...func()) {
+	for _, task := range tasks {
+		s.wg.Add(1)
+		go func(t func()) {
+			t()
+			s.wg.Done()
+		}(task)
+	}
+}
+
+func (s *Supervisor) Stop() {
+	close(s.quit)
+	s.wg.Wait()
+}
+
+// endregion
+
+func max(a, b interface{}) interface{} {
+	v := a.(type)
+	u := b.(type)
+	if v == u {
+		switch v {
+		case int:
+			if v > u {
+				return v
+			} else {
+				return u
+			}
+		case string:
+			if v > u {
+				return v
+			} else {
+				return u
+			}
+		}
+	}
+
+	if a, ok := a.(string); ok {
+		return a
+	}
+	return b
+}
+
+type Message = interface{}
+
 // Paxos library, to be included in an application.
 // Multiple applications will run, each including
 // a Paxos peer.
@@ -30,6 +86,16 @@ const TIMEOUT_WAITING_PROMISES = time.Second // __jm__
 // px.Done(seq int) -- ok to forget all instances <= seq
 // px.Max() int -- highest instance seq known, or -1
 // px.Min() int -- instances before this seq have been forgotten
+
+type ProposerState struct {
+	supervisor *Supervisor
+}
+
+type InstanceState struct {
+	proposer ProposerState
+	curr     interface{}
+}
+
 type Paxos struct {
 	mu         sync.Mutex
 	l          net.Listener
@@ -40,20 +106,9 @@ type Paxos struct {
 	me         int
 	// index into peers[]
 	// Your data here.
-	promise *int
 
-	promises    []bool
-	numPromises int
-
-	proposerQuit chan struct{}
+	instanceToState map[int]InstanceState
 }
-
-// region message structs
-type startMsg struct {
-	seq int
-}
-
-// endregion
 
 // call() sends an RPC to the rpcname handler on server srv
 // with arguments args, waits for the reply, and leaves the
@@ -106,43 +161,44 @@ type idResponse = struct {
 //   - receiving a quit signal
 func (px *Paxos) sendToAll(
 	quit <-chan struct{},
-	responses chan<- idResponse,
+	// responses chan<- idResponse,
+	responses chan<- Message,
 	methodName string,
-	getArgsCallback func(int) interface{}) {
+	buildMessageCallback func(int) Message,
+) {
 
-	for i, peer := range px.peers {
-		if i == px.me {
-			continue
-		}
+	type responseWithStatus = struct {
+		ok       bool
+		response Message
+	}
 
-		type responseWithStatus = struct {
-			ok       bool
-			response interface{}
-		}
+	singleSend := func(
+		idx int, peer string,
+		responseChan chan<- responseWithStatus,
+	) {
+		args := buildMessageCallback(idx)
+		response := new(interface{})
 
-		singleSend := func(
-			idx int, peer string,
-			responseChan chan<- responseWithStatus,
-		) {
-			args := getArgsCallback(idx)
-			response := new(interface{})
+		ok := call(peer, methodName, args, &response)
+		responseChan <- responseWithStatus{ok, response}
+	}
 
-			ok := call(peer, methodName, args, &response)
-			responseChan <- responseWithStatus{ok, response}
-		}
-
-		sendRepeatOnFailure := func(
-			idx int, peer string,
-			responses chan<- idResponse,
-			quit <-chan struct{},
-		) {
+	// this builds a closure so our function has its args already provided
+	taskBuilder := func(
+		idx int, peer string,
+		// responses chan<- idResponse,
+		responses chan<- Message,
+		quit <-chan struct{},
+	) func() {
+		sendRepeatOnFailure := func() {
 			sendResponseChan := make(chan responseWithStatus)
 			for {
 				go singleSend(idx, peer, sendResponseChan)
 				select {
 				case respWithStatus := <-sendResponseChan:
 					if respWithStatus.ok {
-						responses <- idResponse{idx, respWithStatus.response}
+						// responses <- idResponse{idx, respWithStatus.response}
+						responses <- Message{}
 						return
 					} // else timeout, repeat
 				case <-quit:
@@ -151,18 +207,39 @@ func (px *Paxos) sendToAll(
 			}
 		}
 
-		go sendRepeatOnFailure(i, peer, responses, quit)
+		return sendRepeatOnFailure
 	}
+
+	s := NewSupervisor()
+	tasks := make([]func(), 0)
+
+	for i, peer := range px.peers {
+		if i == px.me {
+			continue
+		}
+
+		var task func()
+		task = taskBuilder(i, peer, responses, s.quit)
+		tasks = append(tasks, task)
+	}
+
+	s.Start(tasks...)
+	<-quit
+	s.Stop()
 }
 
-func (px *Paxos) askPromises(seq int, quit <-chan struct{}) <-chan idResponse {
-	promiseResponses := make(chan idResponse)
-	px.sendToAll(quit, promiseResponses, "Paxos.RPC_Ask",
-		func(idx int) interface{} {
-			return seq
+// wrapper around `sendToAll`
+func (px *Paxos) sendPhase1(
+	seq int,
+	quit <-chan struct{},
+	// responseChan chan<- idResponse,
+	responseChan chan<- Message,
+) {
+	px.sendToAll(quit, responseChan, "Paxos.RPC_Ask",
+		func(idx int) Message {
+			return seq // __jm__ TODO: seq with uid
 		},
 	)
-	return promiseResponses
 }
 
 type BreakReason byte
@@ -175,12 +252,19 @@ const (
 	MajorityNack BreakReason = iota
 )
 
-func (px *Paxos) gatherPromises(promiseResponses <-chan idResponse, seq int, proposerQuit <-chan struct{}) BreakReason {
+func (px *Paxos) receivePhase1(
+	// promiseResponses <-chan idResponse,
+	responses <-chan Message,
+	seq int, proposerQuit <-chan struct{},
+) BreakReason {
+
 	promiseAcks := 0
 	promiseNacks := 0
 	majority := len(px.peers)/2 + 1
 
-	handlePromiseResponse := func(responseWithId idResponse) {
+	// __jm__ TODO: rename promiseSeq to acceptorSeq, or more accurately acceptorUid
+	// handlePromiseResponse := func(responseWithId idResponse) {
+	handlePromiseResponse := func(responseWithId Message) {
 		promiseSeq := *responseWithId.response.(*int)
 		switch {
 		// received response is a promise
@@ -197,15 +281,14 @@ func (px *Paxos) gatherPromises(promiseResponses <-chan idResponse, seq int, pro
 	// 	- success due to acks >= majority
 	//  - failure due to nacks >= majority
 	//  - failure due to timeout, reset and send proposals again
-	for start := time.Now(); promiseAcks >= majority ||
-		promiseNacks >= majority ||
-		time.Since(start) < TIMEOUT_WAITING_PROMISES; {
+	for start := time.Now(); time.Since(start) < TIMEOUT_WAITING_PROMISES ||
+		promiseAcks >= majority ||
+		promiseNacks >= majority; {
 
 		select {
-		case responseWithId := <-promiseResponses:
+		case responseWithId := <-responses:
 			handlePromiseResponse(responseWithId)
 		case <-proposerQuit:
-			// cleanup?
 			return ParentQuit
 		}
 	}
@@ -224,31 +307,62 @@ func (px *Paxos) gatherPromises(promiseResponses <-chan idResponse, seq int, pro
 // * it receives a rejection from the majority
 // * it promises to a proposer with a higher sequence number
 func (px *Paxos) proposer(seq int, v interface{}) {
-	{ // Phase 1
-		lastIterResult := None
-		for lastIterResult == TimedOut ||
-			lastIterResult == None {
-			// quit := make(chan struct{})
-			promiseResponses := px.askPromises(seq, px.proposerQuit)
-			lastIterResult = px.gatherPromises(promiseResponses, seq, px.proposerQuit)
+	sendAndReceiveBuilder := func(
+		sendCallback func(),
+		receiveCallback func() BreakReason,
+	) func() BreakReason {
+		return func() BreakReason {
+			sendersSupervisor := NewSupervisor()
+			// responseChan := make(chan idResponse)
+			responseChan := make(chan Message)
+			sendersSupervisor.Start(func() {
+				px.sendCallback(seq, sendersSupervisor.quit, responseChan)
+			})
+			// gatherPromises polls the response channel continuously until a majority of promises is received
+			// or some other condition is met - in particular a signal is sent to proposerQuit
+			result = receiveCallback(responseChan, seq, px.proposerQuit)
+			sendersSupervisor.Stop()
+			return result
 		}
+	}
 
-		switch lastIterResult {
-		case MajorityAck:
-			// no-op, continue
-		case MajorityNack:
-			close(px.proposerQuit)
-			return
-		case ParentQuit:
-			return
-		default: // debug
-			panic("Something went wrong") // debug
-		}
+	phase1 := func() BreakReason {
+		sendersSupervisor := NewSupervisor()
+		// responseChan := make(chan idResponse)
+		responseChan := make(chan Message)
+		sendersSupervisor.Start(func() {
+			px.sendPhase1(seq, sendersSupervisor.quit, responseChan)
+		})
+		// gatherPromises polls the response channel continuously until a majority of promises is received
+		// or some other condition is met - in particular a signal is sent to proposerQuit
+		result = px.receivePhase1(responseChan, seq, px.proposerQuit)
+		sendersSupervisor.Stop()
+		return result
+	}
+
+	phase2 := sendAndReceive(
+		px.sendPhase2(),
+		px.receivePhase2(),
+	)
+
+	switch endPhaseReason := phase1(); endPhaseReason {
+	case MajorityAck:
+		close(px.proposerQuit) // stop instance proposer supervisor
+	case MajorityNack:
+		close(px.proposerQuit)
+		return
+	case ParentQuit:
+		return
+	case TimedOut:
+		// __jm__ retry phase1
+	default: // debug
+		panic("Something went wrong") // debug
 	}
 
 	{ // Phase 2
 		lastIterResult := None
-		for lastIterResult {
+		for lastIterResult == None ||
+			lastIterResult == TimedOut {
 
 		}
 	}
@@ -260,12 +374,21 @@ func (px *Paxos) proposer(seq int, v interface{}) {
 // call Status() to find out if/when agreement
 // is reached.
 func (px *Paxos) Start(seq int, v interface{}) {
-	go px.proposer(seq, v)
+	// C1: PROPOSER PROCESSES DO NOT OVERLAP
+	// runs Paxos.proposer while ensuring that if a proposer process was previously running,
+	// it first signals for it to stop, and then waits for it to release the proposer lock.
 
+	go func() {
+		px.propInitiator.Shake()                      // wait for previous proposer to cleanup
+		px.propInitiator, responder := NewHandshake() // create new handshake to pass to new process
+
+		// C2: THE SEQUENCE NUMBER IS CONSTANT AND UNIQUE TO A PROPOSER PROCESS
+		px.proposer(seq, v, responder)
+	}()
 }
 
 // region RPC
-func (px *Paxos) RPC_Ask(seq int, reply *int) error {
+func (px *Paxos) RPC_Phase1(seq int, reply *int) error {
 	px.mu.Lock()
 	if px.promise == nil || *px.promise < seq {
 		px.promise = &seq
@@ -347,6 +470,8 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 	px.peers = peers
 	px.me = me
 	// Your initialization code here.
+	px.instanceToState = make(map[int]InstanceState)
+	//
 	if rpcs != nil {
 		// caller will create socket &c
 		rpcs.Register(px)
